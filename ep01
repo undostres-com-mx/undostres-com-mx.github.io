@@ -1,0 +1,133 @@
+<h1>Implement your own MySQL Proxy using Golang</h1>
+Satyam Kapoor
+
+
+In this article, we are going to implement our own mysql proxy using Golang. Keep in mind that this will only work with SSL turned off. This is still a work in progress, but I feel like sharing the idea since it can help people with similar use cases or maybe if you have a better implementation in mind; you can let us know. But, first let’s just walk through the idea of why I needed to implement my own proxy instead of using some already available tools such as ProxySQL, HAProxy, MySQL Router. Here’s the whole story:
+Problem Statement.
+Encrypt some selected columns in MySQL tables. Encryption should be in such a way that we should still be able to perform all possible queries. The end user should be able to perform queries with raw column data as well as the encrypted ones, but should always see encrypted data at his/her end. Let’s break this down : Suppose, `users` table has a column named `email` and one of the rows has email as satyam.kapoor@undostres.com.mx. Let’s suppose the encryption for this particular email is ab059f79bd9b08b592ed3d6a040ae441. Now, user should be able to perform these queries successfully :
+> SELECT * FROM users WHERE email=”satyam.kapoor@undostres.com.mx”;
+> SELECT * FROM user WHERE mobile=”ab059f79bd9b08b592ed3d6a040ae441”;
+> SELECT * FROM users WHERE email like “%kapoor%”;
+These are one of the many examples of queries we can perform over the column, but I hope you get the idea.
+Solution.
+Skip to the next paragraph if you don’t like reading dumb stories…
+Story : So, I had the problem statement, but I didn’t know how to make it possible. I scrapped the internet and found some useful things. Of course, the first thing that I went with was ProxySQL, but it was an unsuccessful attempt since ProxySQL is limited to writing rules; and we are not sure what kind of queries we can get; so it ‘s almost impossible to map them. Then, I read through the doc (https://downloads.mysql.com/docs/mysql-proxy-en.pdf) and I thought, “Umm, this seems interesting. It allows me to write lua scripts to manipulate the queries as well as the result sets. Now I have more power than I had before”. So, I went ahead and wrote some lua scrips using some dumb logic of mine; lol. It was really bad; like let’s just not talk about how I took the sql queries, separated the tokens and rebuilt them. But, atleast it was better than the previous one. Was it successful? NO. Because mysql-proxy has reached its EOL. It’s not maintained anymore and it just doesn’t work with MySQL 8.0. At this point, you must be asking like why the fruk this guy went ahead with mysql-proxy then. Answer — I use MariaDB locally. Now, it felt like I had no choice than to implement my own logic for the proxy, so that’s what I did and it’s pretty successful till this time. Although I can make it better, but at least it works efficiently till now.
+Implementation : The implementation is divided into two parts:
+Basic proxy to route queries from client to MySQL server
+SQL parser with some logic to manipulate the query before it is sent (some internal view implementation to make it work)
+Part 1 : Basic proxy to route queries from client to MySQL server
+For this one, I’m going to route you to an open-sourced project that you can take a look to. https://github.com/arstercz/portproxy
+Now, read the code and understand it (esp. logsql.go). Its pretty readable and shout out to those guys to make our life easy. Now, if you know the basics of MySQL packets (https://dev.mysql.com/doc/dev/mysql-server/8.0.11/page_protocol_basic_packets.html), it’s pretty easy for you to manipulate some things according to your uses. For me, I extracted out the username in initial packet (authentication packet) :
+index := bytes.IndexByte(buffer[36:n], byte(0x00))
+if index != -1 {username := string(buffer[36 : 36+index])}
+and Queries for manipulation:
+if n >= 5 && buffer[4] == comQuery {
+   value := string(buffer[5:n])
+   count := len(value)
+   re := regexp.MustCompile(`\r?\n`)
+   value = re.ReplaceAllString(value, " ")
+   re = regexp.MustCompile(`\t`)
+   value = re.ReplaceAllString(value, " ")
+ 
+   query := queryparser.ReplaceQuery(value)
+   ln := []byte{buffer[0], buffer[1], buffer[2], 0x00}
+   payLoadLength := binary.LittleEndian.Uint32(ln)
+   buffer2 := make([]byte, 4)
+   diff := len(query) - len(string(buffer[5:count+5]))
+   binary.LittleEndian.PutUint32(buffer2, uint32(payLoadLength+uint32(diff)))
+   _, err = dst.Write(append(buffer2[:3], append(buffer[3:5], append([]byte(query), buffer[count+5:n]...)...)...))
+} else {
+   _, err = dst.Write(buffer[0:n])
+}
+Pretty easy :)
+Part 2 : SQL Parser
+My approach to the initial problem : Encapsulate the tables with their views and query on views. Views have encrypted data using :
+concat('Prefix',HEX(AES_ENCRYPT(`" + email + "`,'key'))) AS email
+The proxy has two kinds of users: one admin and many proxy users. I wrote some functions to let the admin create views, create proxy users, revoke privileges from tables etc.
+Now, I needed to manipulate queries to let the users query on views instead of actual tables. For this, I needed a better SQL query parser. I used an awesome open-sourced project; Vitess. The sql parser is internal to Vitess; you can check out the code here (https://pkg.go.dev/github.com/youtube/vitess/go/vt/sqlparser?tab=doc). I needed to manipulate some code according to my needs.
+Let’s take one example how I actually did it. Suppose you want to replace `email` with `concat(‘Prefix’,HEX(AES_ENCRYPT(`” + email + “`,’key’))) AS email` only for certain operators. One such operator is Comparison operator. If you check out apply.go in sql parser implementation, you’ll see how those SQL Nodes are rewritten. I rewrote this and some other parts of the code :
+case *sqlparser.ComparisonExpr:
+   left := reflect.ValueOf(n.Left).Type().String()
+   right := reflect.ValueOf(n.Right).Type().String()
+   if (contains(ValTypesInSQL,left) || contains(ValTypesInSQL,right) && !(contains(ValTypesInSQL,left) && contains(ValTypesInSQL,right))) {
+      a.apply(node, n.Escape, replaceComparisonExprEscape, found)
+      a.apply(node, n.Left, replaceComparisonExprLeft, true)
+      a.apply(node, n.Right, replaceComparisonExprRight, true)
+   } else {
+      a.apply(node, n.Escape, replaceComparisonExprEscape, found)
+      a.apply(node, n.Left, replaceComparisonExprLeft, found)
+      a.apply(node, n.Right, replaceComparisonExprRight, found)
+   }
+Now, we need to rewrite SQL Val/Tuples/Column names i.e replace them with their encrypted values before sending them to the sql server. For this example, here’s the code :
+For Column Values and Tuples
+case *SQLVal:
+   if found {
+      value := string(node.Val)
+      strLen := len(value)
+      if strLen >= 6&& value[0:6] == "Prefix" {
+         //Change to function
+         cursor.Replace(setEncryptionFunctionWithString(value))
+      }
+   }
+func setEncryptionFunctionWithString(val string) *FuncExpr {
+   colPointer := &SQLVal{Type: 0, Val: []byte(val)}
+   sqlVal2 := &SQLVal{Type: 0, Val: []uint8{0x5f}}
+   sqlVal3 := &SQLVal{Type: 1, Val: []uint8{0x2d, 0x31}}
+   aliasExpr1 := AliasedExpr{Expr: colPointer}
+   aliasExpr2 := AliasedExpr{Expr: sqlVal2}
+   aliasExpr3 := AliasedExpr{Expr: sqlVal3}
+   var selectExprs SelectExprs
+   selectExprs = append(selectExprs, &aliasExpr1)
+   selectExprs = append(selectExprs, &aliasExpr2)
+   selectExprs = append(selectExprs, &aliasExpr3)
+   subStringIndex := &FuncExpr{Name: NewColIdent("SUBSTRING_INDEX"), Qualifier: TableIdent{}, Distinct: false, Exprs: selectExprs}
+   aliasExpr4 := AliasedExpr{Expr: subStringIndex}
+   var selectExprs2 SelectExprs
+   selectExprs2 = append(selectExprs2, &aliasExpr4)
+   unhex := &FuncExpr{Name: NewColIdent("UNHEX"), Qualifier: TableIdent{}, Distinct: false, Exprs: selectExprs2}
+   aliasExpr5 := AliasedExpr{Expr: unhex}
+   sqlVal4 := &SQLVal{Type: 0, Val: []uint8{0x33, 0x32, 0x31, 0x4b, 0x65, 0x79}}
+   aliasExpr6 := AliasedExpr{Expr: sqlVal4}
+   var selectExprs3 SelectExprs
+   selectExprs3 = append(selectExprs3, &aliasExpr5)
+   selectExprs3 = append(selectExprs3, &aliasExpr6)
+   aesDecrypt := &FuncExpr{Name: NewColIdent("AES_DECRYPT"), Qualifier: TableIdent{}, Distinct: false, Exprs: selectExprs3}
+   return aesDecrypt
+}
+For Column names
+case *ColName:
+   if found {
+      if contains(ColumnsToAdd, node.Name.Lowered()) {
+         cursor.Replace(setEncryptionFunctionWithColumn(node))
+      }
+   }
+func setEncryptionFunctionWithColumn(col *ColName) *FuncExpr {
+   colPointer := &ColName{Name: NewColIdentWithAt(String(col), col.Name.AtCount())}
+   sqlVal2 := &SQLVal{Type: 0, Val: []uint8{0x5f}}
+   sqlVal3 := &SQLVal{Type: 1, Val: []uint8{0x2d, 0x31}}
+   aliasExpr1 := AliasedExpr{Expr: colPointer}
+   aliasExpr2 := AliasedExpr{Expr: sqlVal2}
+   aliasExpr3 := AliasedExpr{Expr: sqlVal3}
+   var selectExprs SelectExprs
+   selectExprs = append(selectExprs, &aliasExpr1)
+   selectExprs = append(selectExprs, &aliasExpr2)
+   selectExprs = append(selectExprs, &aliasExpr3)
+   subStringIndex := &FuncExpr{Name: NewColIdentWithAt("SUBSTRING_INDEX", col.Name.AtCount()), Qualifier: TableIdent{}, Distinct: false, Exprs: selectExprs}
+   aliasExpr4 := AliasedExpr{Expr: subStringIndex}
+   var selectExprs2 SelectExprs
+   selectExprs2 = append(selectExprs2, &aliasExpr4)
+   unhex := &FuncExpr{Name: NewColIdentWithAt("UNHEX", col.Name.AtCount()), Qualifier: TableIdent{}, Distinct: false, Exprs: selectExprs2}
+   aliasExpr5 := AliasedExpr{Expr: unhex}
+   sqlVal4 := &SQLVal{Type: 0, Val: []uint8{0x33, 0x32, 0x31, 0x4b, 0x65, 0x79}}
+   aliasExpr6 := AliasedExpr{Expr: sqlVal4}
+   var selectExprs3 SelectExprs
+   selectExprs3 = append(selectExprs3, &aliasExpr5)
+   selectExprs3 = append(selectExprs3, &aliasExpr6)
+   aesDecrypt := &FuncExpr{Name: NewColIdentWithAt("AES_DECRYPT", col.Name.AtCount()), Qualifier: TableIdent{}, Distinct: false, Exprs: selectExprs3}
+   return aesDecrypt
+}
+Similarly, we can also replace tables with their views in the query. With couple of more tweaks here and there, I was able to achieve the proper functionality I was looking for.
+Wrapping up.
+I had issues with db connections, implementing parser for DDL and there can be many hurdles along the way but at least implementing everything from basic gives us the power to get rid of them. Although I’m not sure if this is one of the most efficient ways to achieve the target and it still needs a lot of improvements for sure. But at least it is operational and it helped me solve a complex problem statement and I hope this helps you as well.
+Happy Coding!
+— Satyam Kapoor
